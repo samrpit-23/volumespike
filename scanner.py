@@ -5,6 +5,8 @@ All price data is held as "panels": one DataFrame per field
 (Open/High/Low/Close/Volume) with dates as rows and symbols as columns.
 """
 import io
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -18,6 +20,7 @@ HEADERS = {
     )
 }
 FIELDS = ["Open", "High", "Low", "Close", "Volume"]
+FALLBACK_CSV = Path(__file__).resolve().parent / "nifty500.csv"
 HORIZONS = (1, 3, 5)  # forward returns measured N trading days after the signal day
 
 
@@ -31,14 +34,15 @@ def load_constituents() -> pd.DataFrame:
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
     except Exception:
-        df = pd.read_csv("nifty500.csv")  # same format as the NSE file
+        df = pd.read_csv(FALLBACK_CSV)  # same format as the NSE file
     df.columns = [c.strip() for c in df.columns]
     df = df[["Company Name", "Industry", "Symbol"]].dropna()
     df["Symbol"] = df["Symbol"].str.strip()
+    df = df.drop_duplicates(subset="Symbol")
     return df.reset_index(drop=True)
 
 
-def fetch_panels(symbols, period="1y") -> dict:
+def fetch_panels(symbols, period="1y", retries: int = 2, pause: float = 3.0) -> dict:
     """Download daily OHLCV for all symbols from Yahoo Finance into panels."""
     import yfinance as yf  # imported here so the module is importable without it
 
@@ -47,18 +51,24 @@ def fetch_panels(symbols, period="1y") -> dict:
 
     for i in range(0, len(tickers), 100):
         batch = tickers[i : i + 100]
-        try:
-            data = yf.download(
-                batch,
-                period=period,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=True,
-                progress=False,
-            )
-        except Exception:
-            continue
+        data = None
+        for attempt in range(retries + 1):  # Yahoo rate-limits; retry a failed batch
+            try:
+                data = yf.download(
+                    batch,
+                    period=period,
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=False,
+                    threads=True,
+                    progress=False,
+                )
+            except Exception:
+                data = None
+            if data is not None and not data.empty:
+                break
+            if attempt < retries:
+                time.sleep(pause * (attempt + 1))
         if data is None or data.empty:
             continue
 
@@ -110,6 +120,8 @@ def scan_day(panels: dict, lookback: int, p: int, entry: str = "close") -> pd.Da
     """
     o, h, l, c, v = (panels[f] for f in FIELDS)
     n = len(c)
+    if not 1 <= p <= n - 1:
+        raise ValueError(f"p must be between 1 and {n - 1}, got {p}")
 
     close = c.iloc[p]
     df = pd.DataFrame(
@@ -179,7 +191,10 @@ def multi_day_signals(
     n = len(c)
     end_pos = min(end_pos, n - 2)
 
-    mult = v / _avg_volume(v, lookback)
+    avg = _avg_volume(v, lookback)
+    # zero average volume would give inf; scan_day drops those, so do the same here
+    # rounded to 2 dp, exactly like scan_day, so "2.00x" on screen always passes a 2x filter
+    mult = (v / avg.where(avg > 0)).replace([np.inf, -np.inf], np.nan).round(2)
     chg = (c / c.shift(1) - 1) * 100
     value = c * v / 1e7
 
@@ -196,6 +211,7 @@ def multi_day_signals(
 
     c_v, o_v = c.values, o.values
     entry_px = o_v[rows + 1, cols] if entry == "open" else c_v[rows, cols]
+    entry_px = np.where(entry_px > 0, entry_px, np.nan)  # avoid divide-by-zero / inf returns
 
     out = pd.DataFrame(
         {
@@ -251,3 +267,17 @@ def daily_summary(signals: pd.DataFrame) -> pd.DataFrame:
     )
     d = d.rename(columns={"avg1": "Avg D+1 %", "avg5": "Avg D+5 %"})
     return d.round(2).sort_index(ascending=False)
+
+
+def direction_summary(signals: pd.DataFrame) -> pd.DataFrame:
+    """Same as horizon_summary, but split into Gainers (price up on signal day) and Losers."""
+    parts = []
+    for label, sub in (
+        ("Gainers", signals[signals["Change %"] > 0]),
+        ("Losers", signals[signals["Change %"] < 0]),
+    ):
+        h = horizon_summary(sub)
+        if not h.empty:
+            h.insert(0, "Direction", label)
+            parts.append(h)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
